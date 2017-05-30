@@ -1,12 +1,15 @@
 use peer::Peer;
 use torrent::Torrent;
-use std::net::{TcpStream, SocketAddr};
+use std::net::{SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::io::{Read, Write, Error, ErrorKind};
 use util::{bytes_to_u32};
 use message::Message;
 use ipc::IpcMessage;
 use std::sync::mpsc::{channel, Receiver};
+use mio::{Events, Poll, Ready, PollOpt, Token};
+use mio::net::TcpStream;
+use std::time::Duration;
 
 const PROTOCOL: &'static str = "BitTorrent protocol";
 const BLOCK_SIZE: u32 = 16384; // 2^14
@@ -51,10 +54,34 @@ impl Connection {
     pub fn connect(client_mutex: Arc<Mutex<Peer>>, peer: Peer, torrent_mutex: Arc<Mutex<Torrent>>) {
         println!("Connecting to {}:{}...", peer.ip, peer.port);
         let addr = SocketAddr::new(peer.ip, peer.port);
+        let poll = Poll::new().unwrap();
+        let mut events = Events::with_capacity(1024);
+
         match TcpStream::connect(&addr) {
             Ok(stream) => {
-                println!("Connected successfully to {}:{}", peer.ip, peer.port);
+                let ready = Ready::writable() | Ready::readable();
+                poll.register(&stream, Token(0), ready, PollOpt::edge()).unwrap();
                 let mut c = Connection::new(client_mutex, peer, stream, torrent_mutex);
+                let mut connected = (false, false);
+                loop {
+                    // println!("{:?}", c.peer.ip);
+                    poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
+                    for event in &events {
+                        if event.token() == Token(0) && event.readiness().is_writable() {
+                            connected.0 = true;
+                        }
+
+                        if event.token() == Token(0) && event.readiness().is_readable() {
+                            println!("readable");
+                            connected.1 = true;
+                        }
+                    }
+
+                    if connected.0 && connected.1 {
+                        break;
+                    }
+                }
+
                 let _ = c.initiate_handshake();
                 println!("Sent handshake");
                 let _ = c.receive_handshake();
@@ -83,8 +110,13 @@ impl Connection {
             message.extend(vec![0;8].into_iter());
             message.extend(t.metainfo.info_hash.iter().cloned());
             message.extend(t.peer_id.bytes());
-            try!(self.stream.write_all(&message));
-            Ok(())
+            match self.stream.write_all(&message) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    println!("Error initiating handshake: {:?}", e);
+                    return Err(e)
+                }
+            }
         }
     }
 
@@ -101,10 +133,10 @@ impl Connection {
         let length = bytes_to_u32(&try!(self.read_n(4)));
         if length > 0 {
             let message = try!(self.read_n(length));
-            Ok(Message::new(&message[0], &message[1..]))
-        } else {
-            Ok(Message::KeepAlive)
+            return Ok(Message::new(&message[0], &message[1..]))
         }
+
+        Ok(Message::KeepAlive)
     }
 
     fn read_n(&mut self, bytes_to_read: u32) -> Result<Vec<u8>, Error> {
@@ -121,12 +153,13 @@ impl Connection {
                 }
             }
             Err(e) => {
+                println!("Error at read_n: {:?}", e);
                 Err(e)
             }
         }
     }
 
-    fn handle_message(&mut self, message: Message) -> Result<bool, Error>{
+    fn handle_message(&mut self, message: Message) -> Result<bool, Error> {
         match message {
             Message::KeepAlive => {},
             Message::Bitfield(bytes) => {
@@ -172,7 +205,7 @@ impl Connection {
                     try!(self.request_next_block());
                 }
             }
-            _ => panic!("Need to process message: {:?}", message)
+            _ => panic!("Unhandled message: {:?}", message)
         };
         Ok(false)
     }
@@ -205,7 +238,7 @@ impl Connection {
                 self.send_message(Message::Request(piece_index, offset, block_length))
             },
             None => {
-                println!("We've downloaded all the pieces we can from this peer.");
+                println!("Exhausted all pieces from peer.");
                 Ok(())
             }
         }

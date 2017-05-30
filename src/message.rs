@@ -58,11 +58,11 @@ impl Message {
                 payload.push(5);
                 payload.extend(bytes);
             },
-            Message::Request(index, offset, amount) => {
+            Message::Request(index, offset, size) => {
                 payload.push(6);
                 payload.extend(u32_to_bytes(index).into_iter());
                 payload.extend(u32_to_bytes(offset).into_iter());
-                payload.extend(u32_to_bytes(amount).into_iter());
+                payload.extend(u32_to_bytes(size).into_iter());
             },
             Message::Piece(index, offset, data) => {
                 payload.push(6);
