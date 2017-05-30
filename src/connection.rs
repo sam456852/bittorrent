@@ -8,8 +8,7 @@ use message::Message;
 use ipc::IpcMessage;
 use std::sync::mpsc::{channel, Receiver};
 use mio::{Events, Poll, Ready, PollOpt, Token};
-use mio::net::TcpStream;
-use std::time::Duration;
+use mio::tcp::{TcpListener, TcpStream};
 
 const PROTOCOL: &'static str = "BitTorrent protocol";
 const BLOCK_SIZE: u32 = 16384; // 2^14
@@ -53,49 +52,45 @@ impl Connection {
 
     pub fn connect(client_mutex: Arc<Mutex<Peer>>, peer: Peer, torrent_mutex: Arc<Mutex<Torrent>>) {
         println!("Connecting to {}:{}...", peer.ip, peer.port);
-        let addr = SocketAddr::new(peer.ip, peer.port);
+
+        const SERVER_TOKEN: Token = Token(0);
+        const CLIENT_TOKEN: Token = Token(1);
+
+        let peer_addr = SocketAddr::new(peer.ip, peer.port);
+        let sock = TcpStream::connect(&peer_addr).unwrap();
+
+        let client_addr = sock.local_addr().unwrap();
+        let server = TcpListener::bind(&client_addr).unwrap();
+
         let poll = Poll::new().unwrap();
+        poll.register(&server, SERVER_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
+
+        let ready = Ready::readable();
+        poll.register(&sock, CLIENT_TOKEN, ready, PollOpt::edge()).unwrap();
+
         let mut events = Events::with_capacity(1024);
 
-        match TcpStream::connect(&addr) {
-            Ok(stream) => {
-                let ready = Ready::writable() | Ready::readable();
-                poll.register(&stream, Token(0), ready, PollOpt::edge()).unwrap();
-                let mut c = Connection::new(client_mutex, peer, stream, torrent_mutex);
-                let mut connected = (false, false);
-                loop {
-                    // println!("{:?}", c.peer.ip);
-                    poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
-                    for event in &events {
-                        if event.token() == Token(0) && event.readiness().is_writable() {
-                            connected.0 = true;
-                        }
-
-                        if event.token() == Token(0) && event.readiness().is_readable() {
-                            println!("readable");
-                            connected.1 = true;
-                        }
-                    }
-
-                    if connected.0 && connected.1 {
-                        break;
-                    }
-                }
-
-                let _ = c.initiate_handshake();
-                println!("Sent handshake");
-                let _ = c.receive_handshake();
-                println!("Received handshake");
-
-                let mut done = false;
-                while !done {
-                    let _ = c.check_messages();
-                    let message = c.receive_message().unwrap();
-                    println!("Received: {:?}", message);
-                    done = c.handle_message(message).unwrap();
+        let mut c = Connection::new(client_mutex, peer, sock, torrent_mutex);
+        loop {
+            poll.poll(&mut events, None).unwrap();
+            for event in events.iter() {
+                println!("{:?}", event);
+                if event.token() == CLIENT_TOKEN && event.readiness().is_writable() {
+                    let _ = c.initiate_handshake();
+                    println!("Sent handshake");
+                    let _ = c.receive_handshake();
+                    println!("Received handshake");
+                    break;
                 }
             }
-            _ => println!("Failed to connect")
+        }
+
+        let mut done = false;
+        while !done {
+            let _ = c.check_messages();
+            let message = c.receive_message().unwrap();
+            println!("Received: {:?}", message);
+            done = c.handle_message(message).unwrap();
         }
     }
 
